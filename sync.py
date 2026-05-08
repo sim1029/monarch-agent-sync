@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -22,6 +23,17 @@ from pathlib import Path
 from dotenv import load_dotenv
 from monarchmoney import MonarchMoney, RequireMFAException
 from supabase import create_client, Client
+
+# App-level logging only — suppress noisy HTTP/network libraries
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("hpack").setLevel(logging.WARNING)
+log = logging.getLogger("monarch-sync")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -34,7 +46,7 @@ SUPABASE_URL           = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY   = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
 # How many days back to sync transactions by default (incremental)
-DEFAULT_LOOKBACK_DAYS = 30
+DEFAULT_LOOKBACK_DAYS = 1
 
 # Session file — avoids re-login every run
 SESSION_FILE = Path(__file__).parent / ".monarch_session"
@@ -54,12 +66,13 @@ async def get_monarch() -> MonarchMoney:
     if SESSION_FILE.exists():
         try:
             mm.load_session(str(SESSION_FILE))
-            print("✓ Loaded saved Monarch session")
+            log.info("Loaded saved Monarch session")
             return mm
         except Exception:
-            print("⚠ Saved session invalid, re-authenticating...")
+            log.warning("Saved session invalid, re-authenticating...")
             SESSION_FILE.unlink(missing_ok=True)
 
+    log.info("Logging in to Monarch Money as %s", MONARCH_EMAIL)
     try:
         await mm.login(
             email=MONARCH_EMAIL,
@@ -69,17 +82,21 @@ async def get_monarch() -> MonarchMoney:
             mfa_secret_key=MONARCH_MFA_SECRET_KEY,
         )
     except RequireMFAException:
-        code = input("MFA code: ").strip()
-        await mm.multi_factor_authenticate(MONARCH_EMAIL, MONARCH_PASSWORD, code)
+        log.info("MFA required — Monarch should have emailed you a code")
+        code = input("Enter the MFA code from your email: ").strip()
+        await mm.multi_factor_authenticate(
+            MONARCH_EMAIL, MONARCH_PASSWORD, code, trusted_device=True,
+        )
 
     mm.save_session(str(SESSION_FILE))
-    print("✓ Authenticated with Monarch Money")
+    log.info("Authenticated with Monarch Money (session saved)")
     return mm
 
 
 # ── Sync helpers ──────────────────────────────────────────────────────────────
 
 def _log_start(sb: Client) -> int:
+    log.info("Starting sync run...")
     result = sb.table("monarch_sync_log").insert({
         "started_at": datetime.now(timezone.utc).isoformat(),
         "status": "running",
@@ -106,7 +123,7 @@ def _log_error(sb: Client, log_id: int, error: str) -> None:
 # ── Account sync ──────────────────────────────────────────────────────────────
 
 async def sync_accounts(mm: MonarchMoney, sb: Client) -> list[dict]:
-    print("\n── Accounts ─────────────────────────────────────────────")
+    log.info("Syncing accounts...")
     raw = await mm.get_accounts()
     accounts = raw.get("accounts", [])
 
@@ -129,14 +146,14 @@ async def sync_accounts(mm: MonarchMoney, sb: Client) -> list[dict]:
     if rows:
         sb.table("monarch_accounts").upsert(rows, on_conflict="id").execute()
 
-    print(f"  {len(rows)} accounts synced")
+    log.info("Synced %d accounts", len(rows))
     return accounts
 
 
 # ── Balance snapshots ─────────────────────────────────────────────────────────
 
 async def sync_balance_snapshots(accounts: list[dict], sb: Client) -> int:
-    print("\n── Balance snapshots ────────────────────────────────────")
+    log.info("Writing balance snapshots...")
     today = date.today().isoformat()
     rows = []
 
@@ -157,7 +174,7 @@ async def sync_balance_snapshots(accounts: list[dict], sb: Client) -> int:
             rows, on_conflict="account_id,snapshot_date"
         ).execute()
 
-    print(f"  {len(rows)} snapshots written")
+    log.info("Wrote %d snapshots", len(rows))
     return len(rows)
 
 
@@ -169,7 +186,7 @@ async def sync_transactions(
     start: date,
     end: date,
 ) -> int:
-    print(f"\n── Transactions ({start} → {end}) ───────────────────────")
+    log.info("Syncing transactions %s → %s", start, end)
 
     # Monarch returns up to 100 per call — paginate
     limit = 500
@@ -205,13 +222,13 @@ async def sync_transactions(
 
         sb.table("monarch_transactions").upsert(rows, on_conflict="id").execute()
         total_synced += len(rows)
-        print(f"  {total_synced} transactions upserted...", end="\r")
+        log.info("Upserted %d transactions so far...", total_synced)
 
         if len(txns) < limit:
             break
         offset += limit
 
-    print(f"  {total_synced} transactions synced        ")
+    log.info("Synced %d transactions total", total_synced)
     return total_synced
 
 
@@ -223,8 +240,8 @@ async def main(start: date | None, end: date | None) -> None:
     if start is None:
         start = end - timedelta(days=DEFAULT_LOOKBACK_DAYS)
 
-    print(f"monarch-agent-sync  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Syncing transactions: {start} → {end}")
+    log.info("monarch-agent-sync starting")
+    log.info("Date range: %s → %s", start, end)
 
     sb = get_supabase()
     log_id = _log_start(sb)
@@ -233,18 +250,29 @@ async def main(start: date | None, end: date | None) -> None:
         mm = await get_monarch()
         accounts = await sync_accounts(mm, sb)
         snapshots = await sync_balance_snapshots(accounts, sb)
-        txn_count = await sync_transactions(mm, sb, start, end)
+        # Chunk into monthly ranges to avoid timeouts on large backfills
+        txn_count = 0
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(
+                date(chunk_start.year + (chunk_start.month // 12),
+                     (chunk_start.month % 12) + 1, 1) - timedelta(days=1),
+                end,
+            )
+            txn_count += await sync_transactions(mm, sb, chunk_start, chunk_end)
+            chunk_start = chunk_end + timedelta(days=1)
 
         _log_finish(sb, log_id,
                     accounts_synced=len(accounts),
                     transactions_synced=txn_count,
                     snapshots_written=snapshots)
 
-        print(f"\n✅ Sync complete — {len(accounts)} accounts, {txn_count} transactions, {snapshots} snapshots")
+        log.info("Sync complete — %d accounts, %d transactions, %d snapshots",
+                 len(accounts), txn_count, snapshots)
 
     except Exception as e:
+        log.error("Sync failed: %s", e, exc_info=True)
         _log_error(sb, log_id, str(e))
-        print(f"\n❌ Sync failed: {e}", file=sys.stderr)
         sys.exit(1)
 
 

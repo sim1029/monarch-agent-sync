@@ -78,7 +78,7 @@ cat > "$PLIST_PATH" << PLIST
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key>
-    <integer>6</integer>
+    <integer>23</integer>
     <key>Minute</key>
     <integer>0</integer>
   </dict>
@@ -97,7 +97,7 @@ PLIST
 
 launchctl unload "$PLIST_PATH" 2>/dev/null || true
 launchctl load "$PLIST_PATH"
-echo "  ✓ launchd job installed — runs daily at 6:00am"
+echo "  ✓ launchd job installed — runs daily at 11:00pm"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
