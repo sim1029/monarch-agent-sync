@@ -1,0 +1,6 @@
+.env
+.venv/
+.monarch_session
+__pycache__/
+*.pyc
+*.pyo
